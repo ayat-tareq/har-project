@@ -1,4 +1,0 @@
-Average_Accuracy: 17.79%
-Average_F1_Score: 0.1756
-Average_Temporal_Coherence: 0.2496
-Number_of_Valid_Splits: 5

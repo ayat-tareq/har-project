@@ -5,3 +5,8 @@ har_env/
 logs_*/
 train and utils versions/
 
+data/
+results/*.pth
+*.zip
+*.dat
+
