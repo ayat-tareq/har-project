@@ -8,7 +8,6 @@ Enhanced HAR SSL Pipeline (v8) with Improved Stability & Performance
 - Better handling of class imbalance
 - Added reproducibility features
 - Enhanced model saving/loading
-- Alignment accuracy improvements
 """
 import os
 import argparse
@@ -23,8 +22,7 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.optim.swa_utils import AveragedModel, SWALR
 from utils import (
     load_data, sliding_window, SinkhornAlign, QuantumHungarian,
-    evaluate_alignment, EarlyStopping, EnsemblePredictor,
-    cosine_similarity, visualize_alignment
+    evaluate_alignment, EarlyStopping, EnsemblePredictor
 )
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.manifold import TSNE
@@ -45,7 +43,6 @@ import math
 import time
 from tqdm import tqdm
 from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
-from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -53,14 +50,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(f"har_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        logging.FileHandler("har_pipeline.log")
     ]
 )
 logger = logging.getLogger(__name__)
 
 # --- Constants for fixed parameters ---
-ALIGNMENT_TEMP = 0.15  # Reduced from 0.2 for sharper alignment
-ALIGNMENT_N_ITER = 150  # Increased from 100 for better convergence
+ALIGNMENT_TEMP = 0.2
+ALIGNMENT_N_ITER = 100
 
 # Global variable to store label encoder if subset is used
 subset_label_encoder = None
@@ -127,7 +124,7 @@ class ChannelAttention(nn.Module):
 
 class EnhancedHybridEncoder(nn.Module):
     """Enhanced encoder with depthwise separable convolutions and channel attention"""
-    def __init__(self, input_dim, latent_dim=768, dropout=0.3, transformer_seq_len=32, num_transformer_layers=3):
+    def __init__(self, input_dim, latent_dim=128, dropout=0.3, transformer_seq_len=32, num_transformer_layers=1):
         super().__init__()
         self.input_dim = input_dim
         self.transformer_seq_len = transformer_seq_len
@@ -166,11 +163,11 @@ class EnhancedHybridEncoder(nn.Module):
         
         # Enhanced projector with residual connection
         self.projector = nn.Sequential(
-            nn.Linear(128 * self.transformer_seq_len, 1024),
-            nn.LayerNorm(1024),
+            nn.Linear(128 * self.transformer_seq_len, 512),
+            nn.LayerNorm(512),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(1024, latent_dim)
+            nn.Linear(512, latent_dim)
         )
         
         # Skip connection
@@ -213,11 +210,11 @@ class EnhancedClassificationHead(nn.Module):
     def __init__(self, latent_dim, num_classes, dropout=0.5, smoothing=0.1, temp=0.5):
         super().__init__()
         self.classifier = nn.Sequential(
-            nn.Linear(latent_dim, 512),
-            nn.LayerNorm(512),
+            nn.Linear(latent_dim, 256),
+            nn.LayerNorm(256),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(512, num_classes)
+            nn.Linear(256, num_classes)
         )
         self.smoothing = smoothing
         self.temp = nn.Parameter(torch.ones(1) * temp)
@@ -239,10 +236,10 @@ class EnhancedClassificationHead(nn.Module):
 
 # Enhanced Augmentation with Sensor-Specific Noise
 class SensorSpecificAugmentation:
-    def __init__(self, time_warp_limit=0.3, channel_mask_prob=0.4,
-                 acc_noise_std=0.15, gyro_noise_std=0.2,
-                 scale_range=(0.7, 1.3), max_mask_length=20,
-                 freq_mask_prob=0.3, sensor_types=None):
+    def __init__(self, time_warp_limit=0.2, channel_mask_prob=0.3,
+                 acc_noise_std=0.1, gyro_noise_std=0.15,
+                 scale_range=(0.8, 1.2), max_mask_length=20,
+                 freq_mask_prob=0.2, sensor_types=None):
         self.time_warp_limit = time_warp_limit
         self.channel_mask_prob = channel_mask_prob
         self.acc_noise_std = acc_noise_std
@@ -305,15 +302,12 @@ class SensorSpecificAugmentation:
             return padded
 
     def __call__(self, x):
-        # Store original device and dtype
-        orig_device = x.device
-        orig_dtype = x.dtype
-        
-        # Apply augmentations that preserve temporal order
+        x = self.time_warp(x)
+        x = self.time_mask(x)
         x = self.channel_mask(x)
         x = self.frequency_mask(x)
         
-        # Apply noise and scaling (temporally safe)
+        # Sensor-specific noise
         noise = torch.zeros_like(x)
         for i, sensor_type in enumerate(self.sensor_types):
             if sensor_type == 'acc':
@@ -331,14 +325,11 @@ class SensorSpecificAugmentation:
         scale_factors = torch.FloatTensor(x.shape[1]).uniform_(*self.scale_range)
         x = x * scale_factors[None, :, None].to(x.device)
         
-        # Time-warping now uses index-preserving interpolation
-        x = self.time_warp(x)
-        
-        return x.to(device=orig_device, dtype=orig_dtype)
+        return x
 
 class TemporalConsistencyLoss(nn.Module):
     """Encourages temporal smoothness in representations"""
-    def __init__(self, weight=0.5):  # Increased from 0.3
+    def __init__(self, weight=0.3):
         super().__init__()
         self.weight = weight
         
@@ -351,7 +342,7 @@ class TemporalConsistencyLoss(nn.Module):
 
 class VICRegLoss(nn.Module):
     """Enhanced VICReg loss with learnable weights and temporal consistency"""
-    def __init__(self, sim_weight=30.0, var_weight=30.0, cov_weight=0.5, temp_weight=0.5):
+    def __init__(self, sim_weight=25.0, var_weight=25.0, cov_weight=1.0, temp_weight=0.3):
         super().__init__()
         self.sim_weight = nn.Parameter(torch.tensor(sim_weight))
         self.var_weight = nn.Parameter(torch.tensor(var_weight))
@@ -432,13 +423,6 @@ def get_device():
         return torch.device("mps")
     else:
         return torch.device("cpu")
-
-def verify_alignment(z1, z2, threshold=0.7):
-    """Verify alignment quality using cosine similarity"""
-    cos_sim = F.cosine_similarity(z1, z2, dim=-1)
-    align_quality = (cos_sim > threshold).float().mean().item()
-    logger.info(f"Alignment quality: {align_quality*100:.2f}% (cosine sim > {threshold})")
-    return align_quality
 
 def train_ssl(X_train, X_val=None, y_val=None, args=None):
     print_stage_header("SSL PRETRAINING", args.dataset)
@@ -528,7 +512,7 @@ def train_ssl(X_train, X_val=None, y_val=None, args=None):
         acc_noise_std=args.acc_noise_std,
         gyro_noise_std=args.gyro_noise_std,
         scale_range=(args.scale_min, args.scale_max),
-        freq_mask_prob=0.3,  # Increased from 0.2
+        freq_mask_prob=0.2,
         sensor_types=sensor_types
     )
     logger.info(f"Using enhanced SensorSpecificAugmentation with sensor-aware noise: {sensor_types}")
@@ -548,7 +532,7 @@ def train_ssl(X_train, X_val=None, y_val=None, args=None):
         model.train()
         total_loss = 0
         with tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}") as pbar:
-            for batch_idx, batch in enumerate(pbar):
+            for batch in pbar:
                 x = batch[0].to(device)
                 with torch.no_grad():
                     x1 = augmenter(x)
@@ -557,11 +541,6 @@ def train_ssl(X_train, X_val=None, y_val=None, args=None):
                     z1 = model(x1)
                     z2 = model(x2)
                     loss = ssl_loss(z1, z2)
-                
-                # Verify alignment for first batch of first epoch
-                if epoch == 0 and batch_idx == 0:
-                    alignment_quality = verify_alignment(z1, z2)
-                
                 optimizer.zero_grad()
                 if use_amp:
                     scaler.scale(loss).backward()
@@ -593,14 +572,7 @@ def train_ssl(X_train, X_val=None, y_val=None, args=None):
             logger.info(f"Validation accuracy: {val_acc*100:.2f}%")
             improved = early_stopping(epoch, -val_acc)
             if improved:
-                # Save full model checkpoint
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': avg_loss,
-                    'val_acc': val_acc
-                }, best_model_path)
+                torch.save(model.state_dict(), best_model_path)
                 logger.info(f"Saved best model to {best_model_path} at epoch {epoch+1}")
             if early_stopping.should_stop:
                 logger.info(f"Early stopping triggered at epoch {epoch+1}")
@@ -631,9 +603,8 @@ def train_ssl(X_train, X_val=None, y_val=None, args=None):
             logger.info("Using SWA model without batch norm update")
     
     if has_validation and os.path.exists(best_model_path):
-        checkpoint = torch.load(best_model_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        logger.info(f"Loaded best model from {best_model_path} (epoch {checkpoint['epoch']}, val acc: {checkpoint['val_acc']*100:.2f}%)")
+        model.load_state_dict(torch.load(best_model_path))
+        logger.info(f"Loaded best model from {best_model_path}")
     
     final_path = f"results/ssl_encoder_{args.dataset.lower()}.pth"
     torch.save(model.state_dict(), final_path)
@@ -1227,19 +1198,6 @@ def visualize_results(y_test, y_pred, Z_test, best_clf, args):
         except Exception as e:
             logger.error(f"Error plotting t-SNE: {e}")
 
-def user_specific_normalization(Z, user_ids):
-    """Apply user-specific feature normalization"""
-    normalized = []
-    for user in np.unique(user_ids):
-        user_mask = (user_ids == user)
-        user_z = Z[user_mask]
-        if len(user_z) > 1:  # Only normalize if we have enough samples
-            scaler = StandardScaler()
-            normalized.append(scaler.fit_transform(user_z))
-        else:
-            normalized.append(user_z)
-    return np.vstack(normalized)
-
 def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
     global subset_label_encoder
     print_stage_header("ALIGNMENT EVALUATION", args.dataset)
@@ -1253,10 +1211,6 @@ def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
     encoder.eval()
     logger.info("Extracting features...")
     Z = get_encoded_features(model=encoder, X=X, device=device, batch_size=args.batch_size)
-    
-    # Apply user-specific normalization
-    logger.info("Applying user-specific feature normalization...")
-    Z_normalized = user_specific_normalization(Z, user_ids)
     
     unique_users = np.unique(user_ids)
     if len(unique_users) < 2:
@@ -1274,7 +1228,7 @@ def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
     max_windows_per_user = 100 if args.dataset == "UCI" else 200
     max_total_windows = 1500
     
-    accuracies, f1_scores, temporal_coherences, prob_scores = [], [], [], []
+    accuracies, f1_scores, temporal_coherences = [], [], []
     
     for split in range(n_splits):
         np.random.shuffle(unique_users)
@@ -1305,17 +1259,12 @@ def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
             if len(target_indices) > max_total_windows:
                 target_indices = np.random.choice(target_indices, max_total_windows, replace=False)
                 
-            Z_source = Z_normalized[source_indices]
-            Z_target = Z_normalized[target_indices]
+            Z_source = Z[source_indices]
+            Z_target = Z[target_indices]
             y_source = y[source_indices]
             y_target = y[target_indices]
             
             logger.info(f"Split {split+1}/{n_splits}: Using {len(Z_source)} source and {len(Z_target)} target windows")
-            
-            # Visualize alignment for first split
-            if split == 0:
-                visualize_alignment(Z_source, Z_target, y_source,
-                                  f"results/{args.dataset.lower()}_alignment_tsne.png")
             
             # Matrix chunking for large datasets
             def chunked_hungarian(aligner, Z1, Z2):
@@ -1334,15 +1283,15 @@ def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
             
             # Use both alignment methods
             for aligner_name, aligner in [
-                ("QuantumHungarian", QuantumHungarian(temp=ALIGNMENT_TEMP, n_iter=ALIGNMENT_N_ITER, feature_weight=0.85)),
+                ("QuantumHungarian", QuantumHungarian(temp=ALIGNMENT_TEMP, n_iter=ALIGNMENT_N_ITER, feature_weight=args.feature_weight)),
                 ("SinkhornAlign", SinkhornAlign(n_iter=20, epsilon=0.1))
             ]:
                 try:
                     if "Quantum" in aligner_name and len(Z_source) * len(Z_target) > 2e6:
                         logger.info(f"Using chunked Hungarian for large matrix: {len(Z_source)}x{len(Z_target)}")
-                        row_ind, col_ind, prob_matrix = chunked_hungarian(aligner, Z_source, Z_target)
+                        row_ind, col_ind = chunked_hungarian(aligner, Z_source, Z_target)
                     else:
-                        row_ind, col_ind, prob_matrix = aligner(Z_source, Z_target)
+                        row_ind, col_ind = aligner(Z_source, Z_target)
                     
                     # Convert labels to original space if needed
                     if subset_label_encoder:
@@ -1351,8 +1300,8 @@ def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
                     else:
                         y_source_orig, y_target_orig = y_source, y_target
                     
-                    acc, f1, temporal, prob_score = evaluate_alignment(y_source_orig, y_target_orig, row_ind, col_ind, prob_matrix)
-                    logger.info(f"Split {split+1}/{n_splits}, {aligner_name} - Acc: {acc*100:.2f}%, F1: {f1:.4f}, Temporal: {temporal:.4f}, Prob: {prob_score:.4f}")
+                    acc, f1, temporal = evaluate_alignment(y_source_orig, y_target_orig, row_ind, col_ind)
+                    logger.info(f"Split {split+1}/{n_splits}, {aligner_name} - Acc: {acc*100:.2f}%, F1: {f1:.4f}, Temporal: {temporal:.4f}")
                     
                     # Store best result for this split
                     if aligner_name == "QuantumHungarian" or (f1_scores and f1 > max(f1_scores)):
@@ -1361,12 +1310,10 @@ def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
                             accuracies[-1] = acc
                             f1_scores[-1] = f1
                             temporal_coherences[-1] = temporal
-                            prob_scores[-1] = prob_score
                         else:
                             accuracies.append(acc)
                             f1_scores.append(f1)
                             temporal_coherences.append(temporal)
-                            prob_scores.append(prob_score)
                 except Exception as e:
                     logger.error(f"Error during {aligner_name} alignment in split {split+1}: {e}")
                     logger.exception(e)
@@ -1379,13 +1326,11 @@ def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
     avg_acc = np.mean(accuracies) if accuracies else 0
     avg_f1 = np.mean(f1_scores) if f1_scores else 0
     avg_temporal = np.mean(temporal_coherences) if temporal_coherences else 0
-    avg_prob = np.mean(prob_scores) if prob_scores else 0
     
     results_msg = (f"\n🎯 Cross-User Alignment Results (Avg over {len(accuracies)} valid splits):\n"
                   f"Accuracy: {avg_acc*100:.2f}%\n"
                   f"F1 Score: {avg_f1:.4f}\n"
-                  f"Temporal Coherence: {avg_temporal:.4f}\n"
-                  f"Probability Score: {avg_prob:.4f}")
+                  f"Temporal Coherence: {avg_temporal:.4f}")
     print(results_msg)
     logger.info(results_msg)
     
@@ -1393,7 +1338,6 @@ def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
         "Average_Accuracy": f"{avg_acc*100:.2f}%",
         "Average_F1_Score": f"{avg_f1:.4f}",
         "Average_Temporal_Coherence": f"{avg_temporal:.4f}",
-        "Average_Probability_Score": f"{avg_prob:.4f}",
         "Number_of_Valid_Splits": len(accuracies)
     }
     results_filename = f"results/{args.dataset.lower()}_alignment_metrics.txt"
@@ -1421,37 +1365,37 @@ def main():
     parser = argparse.ArgumentParser(description="Enhanced HAR SSL Pipeline (v8.1)")
     parser.add_argument("--mode", type=str, default="all", choices=["pretrain", "finetune", "linear_probe", "alignment", "all"], help="Pipeline mode")
     parser.add_argument("--dataset", type=str, default="PAMAP2", choices=["UCI", "PAMAP2"], help="Dataset to use")
-    parser.add_argument("--latent_dim", type=int, default=768, help="Latent dimension size")
+    parser.add_argument("--latent_dim", type=int, default=256, help="Latent dimension size")
     parser.add_argument("--transformer_seq_len", type=int, default=32, help="Sequence length for transformer input")
-    parser.add_argument("--num_transformer_layers", type=int, default=3, help="Number of transformer layers")
+    parser.add_argument("--num_transformer_layers", type=int, default=2, help="Number of transformer layers")
     parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
     parser.add_argument("--window_size", type=int, default=192, help="Window size")
     parser.add_argument("--window_step", type=int, default=64, help="Step size")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
-    parser.add_argument("--epochs", type=int, default=120, help="Epochs for SSL pretraining")
+    parser.add_argument("--epochs", type=int, default=100, help="Epochs for SSL pretraining")
     parser.add_argument("--ft_epochs", type=int, default=30, help="Epochs for fine-tuning")
-    parser.add_argument("--lr", type=float, default=0.0002, help="LR for SSL pretraining")
+    parser.add_argument("--lr", type=float, default=0.0005, help="LR for SSL pretraining")
     parser.add_argument("--ft_lr", type=float, default=0.001, help="LR for fine-tuning")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument("--patience", type=int, default=20, help="Patience for early stopping")
     parser.add_argument("--num_workers", type=int, default=2, help="Data loading workers")
-    parser.add_argument("--ssl_loss", type=str, default="vicreg", choices=["ntxent", "vicreg"], help="SSL loss function")
+    parser.add_argument("--ssl_loss", type=str, default="ntxent", choices=["ntxent", "vicreg"], help="SSL loss function")
     parser.add_argument("--temperature", type=float, default=0.1, help="Temp for contrastive loss")
-    parser.add_argument("--sim_weight", type=float, default=30.0, help="Sim weight for VICReg")
-    parser.add_argument("--var_weight", type=float, default=30.0, help="Var weight for VICReg")
-    parser.add_argument("--cov_weight", type=float, default=0.5, help="Cov weight for VICReg")
-    parser.add_argument("--time_warp_limit", type=float, default=0.3, help="Time warping limit")
-    parser.add_argument("--channel_drop_prob", type=float, default=0.4, help="Channel dropout probability")
-    parser.add_argument("--acc_noise_std", type=float, default=0.15, help="Accelerometer noise std")
-    parser.add_argument("--gyro_noise_std", type=float, default=0.2, help="Gyroscope noise std")
-    parser.add_argument("--scale_min", type=float, default=0.7, help="Minimum scaling factor")
-    parser.add_argument("--scale_max", type=float, default=1.3, help="Maximum scaling factor")
-    parser.add_argument("--feature_weight", type=float, default=0.85, help="Feature weight for QuantumHungarian")
+    parser.add_argument("--sim_weight", type=float, default=25.0, help="Sim weight for VICReg")
+    parser.add_argument("--var_weight", type=float, default=25.0, help="Var weight for VICReg")
+    parser.add_argument("--cov_weight", type=float, default=1.0, help="Cov weight for VICReg")
+    parser.add_argument("--time_warp_limit", type=float, default=0.2, help="Time warping limit")
+    parser.add_argument("--channel_drop_prob", type=float, default=0.3, help="Channel dropout probability")
+    parser.add_argument("--acc_noise_std", type=float, default=0.1, help="Accelerometer noise std")
+    parser.add_argument("--gyro_noise_std", type=float, default=0.15, help="Gyroscope noise std")
+    parser.add_argument("--scale_min", type=float, default=0.8, help="Minimum scaling factor")
+    parser.add_argument("--scale_max", type=float, default=1.2, help="Maximum scaling factor")
+    parser.add_argument("--feature_weight", type=float, default=0.7, help="Feature weight for QuantumHungarian")
     parser.add_argument("--subset_fraction", type=float, default=1.0, help="Fraction of data to use")
-    parser.add_argument("--warmup_epochs", type=int, default=15, help="Warm-up epochs for LR")
-    parser.add_argument("--swa_start", type=int, default=80, help="Epoch to start SWA")
+    parser.add_argument("--warmup_epochs", type=int, default=10, help="Warm-up epochs for LR")
+    parser.add_argument("--swa_start", type=int, default=70, help="Epoch to start SWA")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
-    parser.add_argument("--temp_weight", type=float, default=0.5, help="Temporal consistency loss weight")
+    parser.add_argument("--temp_weight", type=float, default=0.3, help="Temporal consistency loss weight")
     
     args = parser.parse_args()
     logger.info(f"Starting pipeline (v8.1) with arguments: {vars(args)}")
