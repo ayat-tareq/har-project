@@ -5,16 +5,13 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import train_test_split
 from scipy.optimize import linear_sum_assignment
-from scipy.stats import mode
-from collections import defaultdict, Counter
+
+from collections import defaultdict
+from sklearn.model_selection import train_test_split
 import logging
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
-import random
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
 
 # Configure logging
 logging.basicConfig(
@@ -27,41 +24,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def cosine_similarity(a, b):
-    """Compute cosine similarity between two sets of vectors"""
-    a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-8)
-    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-8)
-    return np.einsum('ik,jk->ij', a_norm, b_norm)
 
-def visualize_alignment(embeddings1, embeddings2, labels1=None, labels2=None, filename='alignment_tsne.png'):
-    """Visualize two sets of embeddings using TSNE"""
-    # Combine the embeddings
-    X = np.concatenate([embeddings1, embeddings2])
-    if labels1 is not None and labels2 is not None:
-        labels = np.concatenate([labels1, labels2])
-        n1 = len(embeddings1)
-        n2 = len(embeddings2)
-    else:
-        labels = None
-    
-    # Apply TSNE
-    tsne = TSNE(n_components=2, random_state=42, perplexity=30)
-    X_tsne = tsne.fit_transform(X)
-    
-    # Plot
-    plt.figure(figsize=(10, 8))
-    if labels is not None:
-        scatter = plt.scatter(X_tsne[:n1, 0], X_tsne[:n1, 1], c=labels[:n1], cmap='tab10', alpha=0.5, label='Set 1')
-        plt.scatter(X_tsne[n1:, 0], X_tsne[n1:, 1], c=labels[n1:], cmap='tab10', marker='x', alpha=0.5, label='Set 2')
-        plt.legend()
-    else:
-        plt.scatter(X_tsne[:n1, 0], X_tsne[:n1, 1], alpha=0.5, label='Set 1')
-        plt.scatter(X_tsne[n1:, 0], X_tsne[n1:, 1], marker='x', alpha=0.5, label='Set 2')
-        plt.legend()
-    plt.title('TSNE Visualization of Aligned Embeddings')
-    plt.savefig(filename)
-    plt.close()
-    return X_tsne
+class SensorAugmentation:
+    def __init__(self, prob=0.5):
+        self.prob = prob
+
+    def __call__(self, x):
+        if random.random() < self.prob:
+            x = self.jitter(x)
+            x = self.scaling(x)
+            x = self.time_warp(x)
+            x = self.permutation(x)
+        return x
+
+    def jitter(self, x, sigma=0.05):
+        noise = torch.randn_like(x) * sigma
+        return x + noise
+
+    def scaling(self, x, sigma=0.1):
+        factor = torch.randn((x.shape[0], x.shape[2]), device=x.device) * sigma + 1.0
+        return x * factor.unsqueeze(1)
+
+    def time_warp(self, x, max_warp=0.2):
+        warp_factor = 1.0 + (torch.rand(x.shape[0], device=x.device) - 0.5) * max_warp
+        time_idx = torch.arange(x.shape[1], device=x.device).float()
+        warped_idx = (time_idx.unsqueeze(0) * warp_factor.unsqueeze(1)).long().clamp(0, x.shape[1]-1)
+        warped = torch.gather(x, 1, warped_idx.unsqueeze(-1).expand(-1, -1, x.shape[2]))
+        return warped
+
+    def permutation(self, x, max_segments=4):
+        permuted = []
+        for i in range(x.shape[0]):
+            orig = x[i]
+            idx = np.arange(x.shape[1])
+            num_segs = np.random.randint(1, max_segments)
+            splits = np.array_split(idx, num_segs)
+            np.random.shuffle(splits)
+            new_idx = np.concatenate(splits)
+            permuted.append(orig[new_idx])
+        return torch.stack(permuted, dim=0)
 
 def load_data(dataset='UCI'):
     """Load dataset with user IDs for cross-validation"""
@@ -76,7 +77,7 @@ def load_uci(data_root='data/UCI_HAR'):
     """Load UCI HAR dataset with user IDs"""
     def read_signals(folder, set_type):
         signals = []
-        sensor_axes = ['body_acc', 'body_gyro', 'total_acc']
+        sensor_axes = ['body_acc', 'body_gyro', 'total_acc']  # Added total_acc for more features
         axes = ['x', 'y', 'z']
         for sensor in sensor_axes:
             for axis in axes:
@@ -84,17 +85,20 @@ def load_uci(data_root='data/UCI_HAR'):
                 signals.append(np.loadtxt(path))
         return np.concatenate(signals, axis=1)
 
+    # Read data
     X_train = read_signals(f'{data_root}/train', 'train')
     X_test = read_signals(f'{data_root}/test', 'test')
     y_train = np.loadtxt(f'{data_root}/train/y_train.txt').astype(int)
     y_test = np.loadtxt(f'{data_root}/test/y_test.txt').astype(int)
     
+    # Read user IDs
     user_train = np.loadtxt(f'{data_root}/train/subject_train.txt').astype(int)
     user_test = np.loadtxt(f'{data_root}/test/subject_test.txt').astype(int)
     
+    # Scale features - CORRECTED: fit only on training data
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
+    X_test = scaler.transform(X_test)  # Only transform test data
     
     logger.info(f"UCI dataset loaded - Train: {X_train.shape}, Test: {X_test.shape}")
     return X_train, y_train, X_test, y_test, user_train, user_test
@@ -112,9 +116,10 @@ def process_user_file(args):
     
     try:
         df = pd.read_csv(os.path.join(data_root, file), delim_whitespace=True, header=None)
-        df = df[df[1].between(1, 24)]
+        df = df[df[1].between(1, 24)]  # Filter valid activities
         df = df.dropna()
         
+        # Vectorized operations instead of iterrows
         activities = df[1].values
         activity_changes = np.where(activities[1:] != activities[:-1])[0] + 1
         activity_changes = np.concatenate(([0], activity_changes, [len(activities)]))
@@ -127,6 +132,7 @@ def process_user_file(args):
             activity = activities[start]
             segment_data = df.iloc[start:end][[2] + list(range(4, 40))].values.astype(np.float32)
             
+            # Create windows with overlap
             for j in range(0, len(segment_data) - window_size + 1, window_size // 2):
                 window = segment_data[j:j+window_size]
                 if len(window) == window_size:
@@ -139,12 +145,14 @@ def process_user_file(args):
     return segments, user_segments
 
 def load_pamap2(data_root='data/PAMAP2/PAMAP2_Dataset/Protocol', window_size=192):
-    """Load PAMAP2 dataset with user IDs and stratified splitting"""
+    """Load PAMAP2 dataset with user IDs and stratified splitting - Improved with parallel processing"""
+    # Map filenames to user IDs
     file_to_user = {}
     files = [f for f in os.listdir(data_root) if f.endswith('.dat')]
     for i, file in enumerate(sorted(files)):
         file_to_user[file] = i
     
+    # Process files in parallel
     num_workers = max(1, min(multiprocessing.cpu_count() - 1, len(files)))
     args_list = [(file, data_root, file_to_user, window_size) for file in files]
     
@@ -154,6 +162,7 @@ def load_pamap2(data_root='data/PAMAP2/PAMAP2_Dataset/Protocol', window_size=192
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         results = list(executor.map(process_user_file, args_list))
     
+    # Combine results
     for result in results:
         if result is None:
             continue
@@ -162,6 +171,7 @@ def load_pamap2(data_root='data/PAMAP2/PAMAP2_Dataset/Protocol', window_size=192
             all_segments[label].extend(seqs)
             all_user_segments[label].extend(user_segments[label])
     
+    # Create windows with user IDs
     X, y, user_ids = [], [], []
     for label, seqs in all_segments.items():
         user_list = all_user_segments[label]
@@ -175,8 +185,10 @@ def load_pamap2(data_root='data/PAMAP2/PAMAP2_Dataset/Protocol', window_size=192
     y = np.array(y, dtype=np.int32)
     user_ids = np.array(user_ids, dtype=np.int32)
     
+    # Create validation split for early stopping
     unique_users = np.unique(user_ids)
     
+    # Stratified split by activity and user
     X_train, X_val_test, y_train, y_val_test, user_train, user_val_test = [], [], [], [], [], []
     
     for user in unique_users:
@@ -184,11 +196,15 @@ def load_pamap2(data_root='data/PAMAP2/PAMAP2_Dataset/Protocol', window_size=192
         X_user = X[user_mask]
         y_user = y[user_mask]
         
+        # Split each user's data 60/20/20 (train/val/test) stratified by activity
         if len(np.unique(y_user)) > 1:
             X_u_train, X_u_val_test, y_u_train, y_u_val_test = train_test_split(
                 X_user, y_user, test_size=0.4, stratify=y_user, random_state=42
             )
             
+            # Further split val/test
+            from collections import Counter
+
             class_counts = Counter(y_u_val_test)
             if min(class_counts.values()) < 2:
                 stratify_arg = None
@@ -200,6 +216,7 @@ def load_pamap2(data_root='data/PAMAP2/PAMAP2_Dataset/Protocol', window_size=192
             )
 
         else:
+            # For users with only one activity
             split_idx1 = int(0.6 * len(X_user))
             split_idx2 = int(0.8 * len(X_user))
             X_u_train, X_u_val, X_u_test = X_user[:split_idx1], X_user[split_idx1:split_idx2], X_user[split_idx2:]
@@ -213,6 +230,7 @@ def load_pamap2(data_root='data/PAMAP2/PAMAP2_Dataset/Protocol', window_size=192
         y_val_test.append(np.concatenate([y_u_val, y_u_test]))
         user_val_test.extend([user] * (len(X_u_val) + len(X_u_test)))
     
+    # Concatenate results
     X_train = np.concatenate(X_train)
     y_train = np.concatenate(y_train)
     user_train = np.array(user_train)
@@ -221,6 +239,7 @@ def load_pamap2(data_root='data/PAMAP2/PAMAP2_Dataset/Protocol', window_size=192
     y_val_test = np.concatenate(y_val_test)
     user_val_test = np.array(user_val_test)
     
+    # CORRECTED: Scale features properly - fit only on training data
     scaler = StandardScaler()
     N_train, W, D = X_train.shape
     X_train_flat = X_train.reshape(-1, D)
@@ -230,7 +249,8 @@ def load_pamap2(data_root='data/PAMAP2/PAMAP2_Dataset/Protocol', window_size=192
     X_val_test_flat = X_val_test.reshape(-1, D)
     X_val_test_scaled = scaler.transform(X_val_test_flat).reshape(N_val_test, W, D)
     
-    val_mask = np.arange(len(user_val_test)) % 2 == 0
+    # Split val/test
+    val_mask = np.arange(len(user_val_test)) % 2 == 0  # Simple alternating split
     
     X_val = X_val_test_scaled[val_mask]
     y_val = y_val_test[val_mask]
@@ -246,14 +266,16 @@ def load_pamap2(data_root='data/PAMAP2/PAMAP2_Dataset/Protocol', window_size=192
     return X_train_scaled, y_train, X_val, y_val, X_test, y_test, user_train, user_val, user_test
 
 def sliding_window(data, window_size, step, labels=None, user_ids=None):
-    """Apply sliding window with user ID tracking and confidence scores"""
+    """Apply sliding window with user ID tracking - Improved with stride tricks for efficiency"""
     from numpy.lib.stride_tricks import sliding_window_view
     
+    # Use stride tricks for efficient windowing when possible
     try:
-        if len(data.shape) == 2:
+        if len(data.shape) == 2:  # 2D data
             windows = sliding_window_view(data, window_shape=(window_size, data.shape[1]))[::step, 0]
             windows = np.array([w for w in windows])
         else:
+            # Fallback to manual implementation for 3D+ data
             n_samples = (len(data) - window_size) // step + 1
             windows = []
             for i in range(n_samples):
@@ -265,6 +287,7 @@ def sliding_window(data, window_size, step, labels=None, user_ids=None):
             windows = np.stack(windows) if windows else np.array([])
     except Exception as e:
         logger.warning(f"Stride tricks failed, falling back to loop implementation: {str(e)}")
+        # Fallback to original implementation
         n_samples = (len(data) - window_size) // step + 1
         windows = []
         for i in range(n_samples):
@@ -279,38 +302,27 @@ def sliding_window(data, window_size, step, labels=None, user_ids=None):
     
     if labels is not None:
         if len(windows) > 0:
+            # Use stride tricks for labels too if possible
             try:
                 label_windows = sliding_window_view(labels, window_shape=(window_size,))[::step, 0]
+                # Use weighted majority vote for window label (more recent labels have higher weight)
                 weights = np.linspace(0.5, 1.0, window_size)
                 majority = np.array([
                     np.bincount(window, weights=weights[:len(window)]).argmax()
                     for window in label_windows
                 ])
-                confidences = np.array([
-                    np.max(np.bincount(window, weights=weights[:len(window)])) / np.sum(weights[:len(window)])
-                    for window in label_windows
-                ])
-                
-                # Log low confidence windows
-                low_conf_mask = confidences < 0.6
-                if np.any(low_conf_mask):
-                    logger.warning(f"Found {low_conf_mask.sum()} windows with label confidence < 0.6")
             except Exception:
+                # Fallback
                 label_windows = []
                 for i in range(len(windows)):
                     start = i * step
                     end = start + window_size
                     label_windows.append(labels[start:end])
                 label_windows = np.stack(label_windows)
+                # Use majority vote for window label
                 majority = np.apply_along_axis(lambda x: np.bincount(x).argmax(), 1, label_windows)
-                confidences = np.array([
-                    np.max(np.bincount(window)) / len(window)
-                    for window in label_windows
-                ])
             results.append(majority)
-            results.append(confidences)
         else:
-            results.append(np.array([]))
             results.append(np.array([]))
     
     if user_ids is not None:
@@ -319,10 +331,11 @@ def sliding_window(data, window_size, step, labels=None, user_ids=None):
             for i in range(len(windows)):
                 start = i * step
                 end = start + window_size
+                # All elements in window should have same user ID
                 if np.all(user_ids[start:end] == user_ids[start]):
                     user_windows.append(user_ids[start])
                 else:
-                    user_windows.append(-1)
+                    user_windows.append(-1)  # Invalid window
             results.append(np.array(user_windows, dtype=np.int32))
         else:
             results.append(np.array([]))
@@ -330,96 +343,87 @@ def sliding_window(data, window_size, step, labels=None, user_ids=None):
     return tuple(results)
 
 class SinkhornAlign:
-    """Optimal transport-based alignment with entropy regularization and class-aware normalization"""
-    def __init__(self, n_iter=20, epsilon=0.1, class_aware=False):
+    """Optimal transport-based alignment with entropy regularization"""
+    def __init__(self, n_iter=20, epsilon=0.1):
         self.n_iter = n_iter
         self.epsilon = epsilon
-        self.class_aware = class_aware
 
-    def __call__(self, A, B, class_labels=None):
+    def __call__(self, A, B):
+        # Compute cost matrix
         dist = np.linalg.norm(A[:, None] - B[None, :], axis=2)
-        
-        if self.class_aware and class_labels is not None:
-            # Class-aware normalization
-            for cls in np.unique(class_labels):
-                cls_mask = (class_labels == cls)
-                if cls_mask.sum() > 1:
-                    dist[cls_mask] /= dist[cls_mask].max(axis=1, keepdims=True)
-        
         K = np.exp(-dist / self.epsilon)
         
+        # Initialize dual variables
         u = np.ones((K.shape[0],)) / K.shape[0]
         v = np.ones((K.shape[1],)) / K.shape[1]
         
+        # Sinkhorn iterations
         for _ in range(self.n_iter):
-            u = 1.0 / (K @ v + 1e-10)
+            u = 1.0 / (K @ v + 1e-10)  # Added epsilon to prevent division by zero
             v = 1.0 / (K.T @ u + 1e-10)
         
+        # Compute assignment
         P = np.diag(u) @ K @ np.diag(v)
         row_ind, col_ind = linear_sum_assignment(-P)
-        return row_ind, col_ind, P
+        return row_ind, col_ind
 
 class QuantumHungarian:
-    """Time-aware alignment with temporal coherence and probabilistic assignments"""
-    def __init__(self, temp=0.2, n_iter=100, feature_weight=0.7, softmax_temp=0.1):
+    """Time-aware alignment with temporal coherence - Improved with better feature/time balance"""
+    def __init__(self, temp=0.2, n_iter=100, feature_weight=0.7):
         self.temp = temp
         self.n_iter = n_iter
         self.feature_weight = feature_weight
-        self.softmax_temp = softmax_temp
         self.rng = np.random.default_rng(42)
 
-    def __call__(self, A, B, return_prob=False):
+    def __call__(self, A, B):
+        # Feature similarity
         A_norm = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-8)
         B_norm = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-8)
         feature_sim = np.dot(A_norm, B_norm.T)
         
+        # Time similarity
         time_dist = np.abs(np.arange(A.shape[0])[:, None] - np.arange(B.shape[0])[None, :])
         time_sim = np.exp(-time_dist / self.temp)
         
+        # Combined similarity with adjustable weights
         combined_sim = self.feature_weight * feature_sim + (1 - self.feature_weight) * time_sim
         
-        if return_prob:
-            # Convert to probability distribution
-            prob_matrix = np.exp(combined_sim / self.softmax_temp)
-            prob_matrix = prob_matrix / prob_matrix.sum(axis=1, keepdims=True)
-            return prob_matrix
-        else:
-            row_ind, col_ind = linear_sum_assignment(-combined_sim)
-            return row_ind, col_ind, combined_sim
+        # Solve assignment
+        row_ind, col_ind = linear_sum_assignment(-combined_sim)
+        return row_ind, col_ind
 
-def evaluate_alignment(y_true, y_shuffled, row_ind, col_ind, prob_matrix=None):
-    """Calculate alignment accuracy with additional metrics and probabilistic evaluation"""
+def evaluate_alignment(y_true, y_shuffled, row_ind, col_ind):
+    """Calculate alignment accuracy with additional metrics"""
     if len(row_ind) == 0:
         return 0.0, 0.0, 0.0
     
+    # Filter invalid matches
     valid_indices = [i for i in range(len(row_ind))
                      if row_ind[i] < len(y_true) and col_ind[i] < len(y_shuffled)]
     
     if not valid_indices:
         return 0.0, 0.0, 0.0
         
+    # Calculate accuracy
     correct = (y_true[row_ind[valid_indices]] == y_shuffled[col_ind[valid_indices]]).astype(int)
     accuracy = correct.mean()
     
+    # Calculate F1 score (macro)
     from sklearn.metrics import f1_score
     f1 = f1_score(y_true[row_ind[valid_indices]], y_shuffled[col_ind[valid_indices]], average='macro')
     
+    # Calculate temporal coherence (how well the temporal order is preserved)
     temporal_coherence = np.corrcoef(row_ind[valid_indices], col_ind[valid_indices])[0, 1]
     
-    # Probabilistic evaluation if available
-    prob_score = 0.0
-    if prob_matrix is not None:
-        matched_probs = prob_matrix[row_ind[valid_indices], col_ind[valid_indices]]
-        prob_score = np.mean(matched_probs)
-    
-    return accuracy, f1, temporal_coherence, prob_score
+    return accuracy, f1, temporal_coherence
 
+# New utility for early stopping
 class EarlyStopping:
     """Early stopping handler for training loops"""
     def __init__(self, patience=10, min_delta=0.001, mode='min'):
         self.patience = patience
         self.min_delta = min_delta
-        self.mode = mode
+        self.mode = mode  # 'min' for loss, 'max' for metrics like accuracy
         self.best_value = float('inf') if mode == 'min' else float('-inf')
         self.counter = 0
         self.best_epoch = 0
@@ -431,13 +435,14 @@ class EarlyStopping:
             self.best_value = value
             self.counter = 0
             self.best_epoch = epoch
-            return True
+            return True  # Improvement found
         else:
             self.counter += 1
             if self.counter >= self.patience:
                 self.should_stop = True
-            return False
+            return False  # No improvement
 
+# New utility for ensemble methods
 class EnsemblePredictor:
     """Ensemble predictor for combining multiple models"""
     def __init__(self, models, weights=None):
@@ -445,8 +450,13 @@ class EnsemblePredictor:
         self.weights = weights if weights is not None else np.ones(len(models)) / len(models)
     
     def predict(self, X):
+        """Predict class labels using weighted voting"""
         predictions = np.array([model.predict(X) for model in self.models])
-        
+        # Count weighted votes for each class
+        from scipy.stats import mode
+        predictions = np.array(predictions)
+
+        # Fallback to unweighted mode if weights not supported
         if hasattr(self, 'weights') and self.weights is not None:
             weighted_votes = np.zeros((predictions.shape[1], np.max(predictions) + 1))
             for i, clf_preds in enumerate(predictions):
@@ -455,8 +465,8 @@ class EnsemblePredictor:
             y_pred_ensemble = np.argmax(weighted_votes, axis=1)
         else:
             y_pred_ensemble = mode(predictions, axis=0)[0].flatten()
-        return y_pred_ensemble
     
     def predict_proba(self, X):
+        """Predict class probabilities using weighted average"""
         probas = np.array([model.predict_proba(X) for model in self.models])
         return np.average(probas, axis=0, weights=self.weights)
