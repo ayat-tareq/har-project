@@ -1,0 +1,10 @@
+# Virtual environment
+har_env/
+
+# Data files
+data/*.csv
+data/*.npy
+
+# Python cache
+__pycache__/
+*.pyc

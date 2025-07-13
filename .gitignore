@@ -1,12 +1,9 @@
-.DS_Store
-*.log
-*.zip
-har_env/
-logs_*/
-train and utils versions/
 
-data/
-results/*.pth
-*.zip
 *.dat
+*.pth
+*.zip
+data/
+results/
+har_env/
+train and utils versions/
 
