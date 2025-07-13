@@ -6,9 +6,6 @@ Enhanced HAR SSL Pipeline (v8) with Improved Stability & Performance
 - Added channel masking augmentation
 - Improved model architecture
 - Better handling of class imbalance
-- Added reproducibility features
-- Enhanced model saving/loading
-- Alignment accuracy improvements
 """
 import os
 import argparse
@@ -18,18 +15,17 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, TensorDataset
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.swa_utils import AveragedModel, SWALR
 from utils import (
     load_data, sliding_window, SinkhornAlign, QuantumHungarian,
-    evaluate_alignment, EarlyStopping, EnsemblePredictor,
-    cosine_similarity, visualize_alignment
+    evaluate_alignment, EarlyStopping, EnsemblePredictor
 )
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.manifold import TSNE
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, StackingClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.svm import SVC
 from sklearn.metrics import (
     confusion_matrix, f1_score, accuracy_score,
@@ -45,7 +41,6 @@ import math
 import time
 from tqdm import tqdm
 from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
-from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -53,14 +48,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(f"har_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        logging.FileHandler("har_pipeline.log")
     ]
 )
 logger = logging.getLogger(__name__)
 
 # --- Constants for fixed parameters ---
-ALIGNMENT_TEMP = 0.15  # Reduced from 0.2 for sharper alignment
-ALIGNMENT_N_ITER = 150  # Increased from 100 for better convergence
+ALIGNMENT_TEMP = 0.2
+ALIGNMENT_N_ITER = 100
 
 # Global variable to store label encoder if subset is used
 subset_label_encoder = None
@@ -105,29 +100,9 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         return self.dropout(x + self.scale * self.pe[:, :x.size(1)])
 
-class ChannelAttention(nn.Module):
-    """Channel attention module"""
-    def __init__(self, in_channels, reduction=8):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.max_pool = nn.AdaptiveMaxPool1d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(in_channels, in_channels // reduction),
-            nn.ReLU(),
-            nn.Linear(in_channels // reduction, in_channels),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x):
-        b, c, _ = x.shape
-        avg_out = self.fc(self.avg_pool(x).view(b, c))
-        max_out = self.fc(self.max_pool(x).view(b, c))
-        scale = torch.sigmoid(avg_out + max_out)
-        return x * scale.view(b, c, 1)
-
 class EnhancedHybridEncoder(nn.Module):
-    """Enhanced encoder with depthwise separable convolutions and channel attention"""
-    def __init__(self, input_dim, latent_dim=768, dropout=0.3, transformer_seq_len=32, num_transformer_layers=3):
+    """Enhanced encoder with depthwise separable convolutions"""
+    def __init__(self, input_dim, latent_dim=128, dropout=0.3, transformer_seq_len=32, num_transformer_layers=1):
         super().__init__()
         self.input_dim = input_dim
         self.transformer_seq_len = transformer_seq_len
@@ -137,20 +112,22 @@ class EnhancedHybridEncoder(nn.Module):
         if input_dim > 0 and conv1_out % input_dim != 0:
             conv1_out = (conv1_out // input_dim + 1) * input_dim
         
-        # First depthwise separable convolution
-        self.depthwise1 = nn.Conv1d(input_dim, input_dim, kernel_size=5, padding=2, groups=input_dim)
-        self.pointwise1 = nn.Conv1d(input_dim, conv1_out, kernel_size=1)
-        self.bn1 = nn.BatchNorm1d(conv1_out)
-        
-        # Second depthwise separable convolution
-        self.depthwise2 = nn.Conv1d(conv1_out, conv1_out, kernel_size=3, padding=1, groups=conv1_out)
-        self.pointwise2 = nn.Conv1d(conv1_out, 128, kernel_size=1)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.attn = ChannelAttention(128)
-        self.pool = nn.AdaptiveAvgPool1d(transformer_seq_len)
-        
-        self.gelu = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
+        self.conv_branch = nn.Sequential(
+            # Depthwise convolution
+            nn.Conv1d(input_dim, input_dim, kernel_size=5, padding=2, groups=input_dim),
+            # Pointwise convolution
+            nn.Conv1d(input_dim, conv1_out, kernel_size=1),
+            nn.BatchNorm1d(conv1_out),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            
+            # Second depthwise separable convolution
+            nn.Conv1d(conv1_out, conv1_out, kernel_size=3, padding=1, groups=conv1_out),
+            nn.Conv1d(conv1_out, 128, kernel_size=1),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(self.transformer_seq_len)
+        )
         
         self.pos_enc = PositionalEncoding(d_model=128, dropout=dropout)
         
@@ -166,39 +143,26 @@ class EnhancedHybridEncoder(nn.Module):
         
         # Enhanced projector with residual connection
         self.projector = nn.Sequential(
-            nn.Linear(128 * self.transformer_seq_len, 1024),
-            nn.LayerNorm(1024),
+            nn.Linear(128 * self.transformer_seq_len, 512),
+            nn.LayerNorm(512),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(1024, latent_dim)
+            nn.Linear(512, latent_dim)
         )
         
         # Skip connection
         self.skip = nn.Linear(128 * self.transformer_seq_len, latent_dim)
 
     def forward(self, x):
-        # Input handling - ensure proper dimensions
-        if x.dim() == 3 and x.shape[2] == self.input_dim:  # [batch, seq_len, features]
-            x = x.permute(0, 2, 1)  # Convert to [batch, features, seq_len]
-        elif x.dim() == 3 and x.shape[1] == self.input_dim:  # [batch, features, seq_len]
-            pass  # Already in correct format
+        # Input handling
+        if x.dim() == 3 and x.shape[1] == self.input_dim:
+            pass
+        elif x.dim() == 3:  # [batch, seq_len, features]
+            x = x.permute(0, 2, 1)
         else:
-            raise ValueError(f"Unexpected input shape: {x.shape}. Expected (batch, seq_len, features) or (batch, features, seq_len)")
+            raise ValueError(f"Unexpected input shape: {x.shape}")
             
-        # Convolutional branch
-        x = self.depthwise1(x)
-        x = self.pointwise1(x)
-        x = self.bn1(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        
-        x = self.depthwise2(x)
-        x = self.pointwise2(x)
-        x = self.bn2(x)
-        x = self.gelu(x)
-        x = self.attn(x)
-        x = self.pool(x)
-        
+        x = self.conv_branch(x)
         x = x.permute(0, 2, 1)  # [batch, seq, features]
         x = self.pos_enc(x)
         x = self.transformer(x)
@@ -213,11 +177,11 @@ class EnhancedClassificationHead(nn.Module):
     def __init__(self, latent_dim, num_classes, dropout=0.5, smoothing=0.1, temp=0.5):
         super().__init__()
         self.classifier = nn.Sequential(
-            nn.Linear(latent_dim, 512),
-            nn.LayerNorm(512),
+            nn.Linear(latent_dim, 256),
+            nn.LayerNorm(256),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(512, num_classes)
+            nn.Linear(256, num_classes)
         )
         self.smoothing = smoothing
         self.temp = nn.Parameter(torch.ones(1) * temp)
@@ -237,20 +201,16 @@ class EnhancedClassificationHead(nn.Module):
         loss = confidence * nll_loss + self.smoothing * smooth_loss
         return loss.mean()
 
-# Enhanced Augmentation with Sensor-Specific Noise
-class SensorSpecificAugmentation:
-    def __init__(self, time_warp_limit=0.3, channel_mask_prob=0.4,
-                 acc_noise_std=0.15, gyro_noise_std=0.2,
-                 scale_range=(0.7, 1.3), max_mask_length=20,
-                 freq_mask_prob=0.3, sensor_types=None):
+# Enhanced Augmentation with Channel Masking
+class SensorAugmentation:
+    def __init__(self, time_warp_limit=0.2, channel_mask_prob=0.3, noise_std=0.1,
+                 scale_range=(0.8, 1.2), max_mask_length=20, freq_mask_prob=0.2):
         self.time_warp_limit = time_warp_limit
         self.channel_mask_prob = channel_mask_prob
-        self.acc_noise_std = acc_noise_std
-        self.gyro_noise_std = gyro_noise_std
+        self.noise_std = noise_std
         self.scale_range = scale_range
         self.max_mask_length = max_mask_length
         self.freq_mask_prob = freq_mask_prob
-        self.sensor_types = sensor_types or []
         
     def time_mask(self, x):
         """Apply time masking to sensor data"""
@@ -305,58 +265,26 @@ class SensorSpecificAugmentation:
             return padded
 
     def __call__(self, x):
-        # Store original device and dtype
-        orig_device = x.device
-        orig_dtype = x.dtype
-        
-        # Apply augmentations that preserve temporal order
+        x = self.time_warp(x)
+        x = self.time_mask(x)
         x = self.channel_mask(x)
         x = self.frequency_mask(x)
         
-        # Apply noise and scaling (temporally safe)
-        noise = torch.zeros_like(x)
-        for i, sensor_type in enumerate(self.sensor_types):
-            if sensor_type == 'acc':
-                noise_std = self.acc_noise_std
-            elif sensor_type == 'gyro':
-                noise_std = self.gyro_noise_std
-            else:  # Default noise
-                noise_std = (self.acc_noise_std + self.gyro_noise_std) / 2
-                
-            noise[:, i, :] = torch.normal(0, noise_std, size=(x.shape[0], x.shape[2]))
-        
-        x = x + noise
-        
-        # Channel-specific scaling
         scale_factors = torch.FloatTensor(x.shape[1]).uniform_(*self.scale_range)
         x = x * scale_factors[None, :, None].to(x.device)
         
-        # Time-warping now uses index-preserving interpolation
-        x = self.time_warp(x)
+        noise = torch.normal(0, self.noise_std, size=x.shape, device=x.device)
+        x = x + noise
         
-        return x.to(device=orig_device, dtype=orig_dtype)
-
-class TemporalConsistencyLoss(nn.Module):
-    """Encourages temporal smoothness in representations"""
-    def __init__(self, weight=0.5):  # Increased from 0.3
-        super().__init__()
-        self.weight = weight
-        
-    def forward(self, z):
-        if z.size(0) < 2:  # Need at least 2 samples
-            return torch.tensor(0.0, device=z.device)
-            
-        z_diff = z[1:] - z[:-1]
-        return self.weight * torch.mean(z_diff.pow(2))
+        return x
 
 class VICRegLoss(nn.Module):
-    """Enhanced VICReg loss with learnable weights and temporal consistency"""
-    def __init__(self, sim_weight=30.0, var_weight=30.0, cov_weight=0.5, temp_weight=0.5):
+    """Enhanced VICReg loss with learnable weights"""
+    def __init__(self, sim_weight=25.0, var_weight=25.0, cov_weight=1.0):
         super().__init__()
         self.sim_weight = nn.Parameter(torch.tensor(sim_weight))
         self.var_weight = nn.Parameter(torch.tensor(var_weight))
         self.cov_weight = nn.Parameter(torch.tensor(cov_weight))
-        self.temp_loss = TemporalConsistencyLoss(weight=temp_weight)
         
     def forward(self, z1, z2):
         sim_loss = F.mse_loss(z1, z2)
@@ -372,12 +300,9 @@ class VICRegLoss(nn.Module):
         mask = ~torch.eye(z1.shape[1], dtype=torch.bool, device=z1.device)
         cov_loss = cov_z1[mask].pow_(2).mean() + cov_z2[mask].pow_(2).mean()
         
-        temporal_loss = self.temp_loss(z1) + self.temp_loss(z2)
-        
         loss = (self.sim_weight * sim_loss +
                 self.var_weight * var_loss +
-                self.cov_weight * cov_loss +
-                temporal_loss)
+                self.cov_weight * cov_loss)
         return loss
 
 class NTXentLoss(nn.Module):
@@ -423,23 +348,6 @@ def get_encoded_features(model, X, device, batch_size=64):
             Z_all.append(Z.cpu())
     return torch.cat(Z_all).numpy()
 
-def get_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        # Use float32 for MPS compatibility
-        torch.set_default_dtype(torch.float32)
-        return torch.device("mps")
-    else:
-        return torch.device("cpu")
-
-def verify_alignment(z1, z2, threshold=0.7):
-    """Verify alignment quality using cosine similarity"""
-    cos_sim = F.cosine_similarity(z1, z2, dim=-1)
-    align_quality = (cos_sim > threshold).float().mean().item()
-    logger.info(f"Alignment quality: {align_quality*100:.2f}% (cosine sim > {threshold})")
-    return align_quality
-
 def train_ssl(X_train, X_val=None, y_val=None, args=None):
     print_stage_header("SSL PRETRAINING", args.dataset)
     device = get_device()
@@ -461,22 +369,7 @@ def train_ssl(X_train, X_val=None, y_val=None, args=None):
         X_train.shape[2], args.latent_dim, dropout=args.dropout,
         transformer_seq_len=args.transformer_seq_len,
         num_transformer_layers=args.num_transformer_layers
-    )
-    
-    # Log model architecture and parameters
-    logger.info(f"Model architecture:\n{model}")
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model has {total_params} trainable parameters")
-    
-    if total_params == 0:
-        logger.error("Model has no trainable parameters! Check architecture.")
-        raise RuntimeError("Model has no trainable parameters")
-    
-    # Log each parameter
-    for name, param in model.named_parameters():
-        logger.info(f"{name}: {param.shape} (requires_grad={param.requires_grad})")
-    
-    model = model.to(device)
+    ).to(device)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
@@ -495,26 +388,10 @@ def train_ssl(X_train, X_val=None, y_val=None, args=None):
     swa_start = min(args.epochs - 5, args.swa_start)
     logger.info(f"Using SWA starting at epoch {swa_start} with LR {args.lr*0.5}")
     
-    # Define sensor types based on dataset
-    if args.dataset == "UCI":
-        # UCI: 3 body_acc, 3 body_gyro, 3 total_acc
-        sensor_types = (['acc']*3 + ['gyro']*3 + ['acc']*3)
-    elif args.dataset == "PAMAP2":
-        # PAMAP2: 3D acc, 3D gyro, 3D mag, etc.
-        sensor_types = (['acc']*3 + ['gyro']*3 + ['mag']*3 +
-                       ['temp'] + ['hr'] + ['acc']*4)
-    else:
-        sensor_types = None
-    
     # Select SSL loss
     if args.ssl_loss == "vicreg":
-        ssl_loss = VICRegLoss(
-            sim_weight=args.sim_weight,
-            var_weight=args.var_weight,
-            cov_weight=args.cov_weight,
-            temp_weight=args.temp_weight
-        )
-        logger.info("Using enhanced VICReg loss with temporal consistency")
+        ssl_loss = VICRegLoss(sim_weight=args.sim_weight, var_weight=args.var_weight, cov_weight=args.cov_weight)
+        logger.info("Using VICReg loss")
     else:
         ssl_loss = NTXentLoss(temperature=args.temperature)
         logger.info(f"Using NT-Xent loss with temperature={args.temperature}")
@@ -522,16 +399,14 @@ def train_ssl(X_train, X_val=None, y_val=None, args=None):
     use_amp = device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
     
-    augmenter = SensorSpecificAugmentation(
+    augmenter = SensorAugmentation(
         time_warp_limit=args.time_warp_limit,
         channel_mask_prob=args.channel_drop_prob,
-        acc_noise_std=args.acc_noise_std,
-        gyro_noise_std=args.gyro_noise_std,
+        noise_std=args.noise_std,
         scale_range=(args.scale_min, args.scale_max),
-        freq_mask_prob=0.3,  # Increased from 0.2
-        sensor_types=sensor_types
+        freq_mask_prob=0.2
     )
-    logger.info(f"Using enhanced SensorSpecificAugmentation with sensor-aware noise: {sensor_types}")
+    logger.info("Using enhanced SensorAugmentation with time/channel/frequency masking")
     
     train_loader = DataLoader(
         TensorDataset(torch.tensor(X_train, dtype=torch.float32)),
@@ -548,7 +423,7 @@ def train_ssl(X_train, X_val=None, y_val=None, args=None):
         model.train()
         total_loss = 0
         with tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}") as pbar:
-            for batch_idx, batch in enumerate(pbar):
+            for batch in pbar:
                 x = batch[0].to(device)
                 with torch.no_grad():
                     x1 = augmenter(x)
@@ -557,11 +432,6 @@ def train_ssl(X_train, X_val=None, y_val=None, args=None):
                     z1 = model(x1)
                     z2 = model(x2)
                     loss = ssl_loss(z1, z2)
-                
-                # Verify alignment for first batch of first epoch
-                if epoch == 0 and batch_idx == 0:
-                    alignment_quality = verify_alignment(z1, z2)
-                
                 optimizer.zero_grad()
                 if use_amp:
                     scaler.scale(loss).backward()
@@ -593,14 +463,7 @@ def train_ssl(X_train, X_val=None, y_val=None, args=None):
             logger.info(f"Validation accuracy: {val_acc*100:.2f}%")
             improved = early_stopping(epoch, -val_acc)
             if improved:
-                # Save full model checkpoint
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': avg_loss,
-                    'val_acc': val_acc
-                }, best_model_path)
+                torch.save(model.state_dict(), best_model_path)
                 logger.info(f"Saved best model to {best_model_path} at epoch {epoch+1}")
             if early_stopping.should_stop:
                 logger.info(f"Early stopping triggered at epoch {epoch+1}")
@@ -631,9 +494,8 @@ def train_ssl(X_train, X_val=None, y_val=None, args=None):
             logger.info("Using SWA model without batch norm update")
     
     if has_validation and os.path.exists(best_model_path):
-        checkpoint = torch.load(best_model_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        logger.info(f"Loaded best model from {best_model_path} (epoch {checkpoint['epoch']}, val acc: {checkpoint['val_acc']*100:.2f}%)")
+        model.load_state_dict(torch.load(best_model_path))
+        logger.info(f"Loaded best model from {best_model_path}")
     
     final_path = f"results/ssl_encoder_{args.dataset.lower()}.pth"
     torch.save(model.state_dict(), final_path)
@@ -755,18 +617,10 @@ def fine_tune(encoder, X_train, y_train, X_val, y_val, args):
         torch.tensor(y_val, dtype=torch.long)
     )
     
-    # Create class-weighted sampler
-    class_counts = np.bincount(y_train)
-    class_weights = 1.0 / class_counts
-    sample_weights = class_weights[y_train]
-    sampler = WeightedRandomSampler(
-        sample_weights, len(sample_weights), replacement=True
-    )
-    
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        sampler=sampler,  # Use weighted sampler
+        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True
     )
@@ -998,34 +852,9 @@ def linear_probe(X_train, y_train, X_val, y_val, X_test, y_test, encoder, args):
     best_clf = classifiers[best_idx]
     best_clf_name = classifier_names[best_idx]
     
-    # Create stacked classifier
-    logger.info("Training Stacked Classifier...")
-    base_estimators = [
-        ('lr', lr_clf.best_estimator_),
-        ('svm', svm_clf.best_estimator_),
-        ('rf', rf_clf.best_estimator_)
-    ]
-    
-    stacked_clf = StackingClassifier(
-        estimators=base_estimators,
-        final_estimator=LogisticRegression(
-            max_iter=2000,
-            class_weight='balanced',
-            multi_class='multinomial'
-        ),
-        cv=5,
-        n_jobs=args.num_workers
-    )
-    
-    # Train on combined train+val data
-    Z_combined = np.vstack((Z_train_scaled, Z_val_scaled))
-    y_combined = np.concatenate((y_train, y_val))
-    stacked_clf.fit(Z_combined, y_combined)
-    
     joblib.dump(best_clf, f"results/best_classifier_{args.dataset.lower()}.pkl")
     joblib.dump(ensemble, f"results/ensemble_classifier_{args.dataset.lower()}.pkl")
-    joblib.dump(stacked_clf, f"results/stacked_classifier_{args.dataset.lower()}.pkl")
-    logger.info(f"Saved best classifier ({best_clf_name}), ensemble and stacked classifier to results/")
+    logger.info(f"Saved best classifier ({best_clf_name}) and ensemble to results/")
     
     results_filename = f"results/{args.dataset.lower()}_linear_probe_metrics.txt"
     all_metrics = {}
@@ -1100,23 +929,13 @@ def linear_probe(X_train, y_train, X_val, y_val, X_test, y_test, encoder, args):
         logger.error(f"Error getting predictions from ensemble: {e}")
         all_metrics["Ensemble_Error"] = str(e)
     
-    # Evaluate stacked classifier
-    try:
-        y_pred_stacked = stacked_clf.predict(Z_test_scaled)
-        y_proba_stacked = stacked_clf.predict_proba(Z_test_scaled)
-        stacked_metrics = calculate_and_store_metrics(y_test, y_pred_stacked, "StackedClassifier", y_proba_stacked)
-        all_metrics.update(stacked_metrics)
-    except Exception as e:
-        logger.error(f"Error getting predictions from stacked classifier: {e}")
-        all_metrics["StackedClassifier_Error"] = str(e)
-    
     save_metrics_to_file(all_metrics, results_filename)
     
     # Visualization
-    visualize_results(y_test, y_pred_stacked, Z_test_scaled, best_clf, args)
+    visualize_results(y_test, y_pred_ensemble, Z_test_scaled, best_clf, args)
     
     print_stage_footer("LINEAR PROBING", args.dataset)
-    return stacked_clf
+    return ensemble
 
 def visualize_results(y_test, y_pred, Z_test, best_clf, args):
     """Generate visualizations for results"""
@@ -1227,19 +1046,6 @@ def visualize_results(y_test, y_pred, Z_test, best_clf, args):
         except Exception as e:
             logger.error(f"Error plotting t-SNE: {e}")
 
-def user_specific_normalization(Z, user_ids):
-    """Apply user-specific feature normalization"""
-    normalized = []
-    for user in np.unique(user_ids):
-        user_mask = (user_ids == user)
-        user_z = Z[user_mask]
-        if len(user_z) > 1:  # Only normalize if we have enough samples
-            scaler = StandardScaler()
-            normalized.append(scaler.fit_transform(user_z))
-        else:
-            normalized.append(user_z)
-    return np.vstack(normalized)
-
 def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
     global subset_label_encoder
     print_stage_header("ALIGNMENT EVALUATION", args.dataset)
@@ -1254,10 +1060,6 @@ def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
     logger.info("Extracting features...")
     Z = get_encoded_features(model=encoder, X=X, device=device, batch_size=args.batch_size)
     
-    # Apply user-specific normalization
-    logger.info("Applying user-specific feature normalization...")
-    Z_normalized = user_specific_normalization(Z, user_ids)
-    
     unique_users = np.unique(user_ids)
     if len(unique_users) < 2:
         logger.warning("Skipping alignment evaluation: Need at least 2 users.")
@@ -1270,122 +1072,61 @@ def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
         print_stage_footer("ALIGNMENT EVALUATION", args.dataset)
         return 0, 0, 0
     
-    # Add downsampling for large datasets
-    max_windows_per_user = 100 if args.dataset == "UCI" else 200
-    max_total_windows = 1500
-    
-    accuracies, f1_scores, temporal_coherences, prob_scores = [], [], [], []
+    accuracies, f1_scores, temporal_coherences = [], [], []
     
     for split in range(n_splits):
         np.random.shuffle(unique_users)
         split_idx = len(unique_users) // 2
         source_users, target_users = unique_users[:split_idx], unique_users[split_idx:]
         
-        try:
-            # Downsample windows per user
-            def get_sampled_indices(users):
-                indices = []
-                for user in users:
-                    user_idx = np.where(user_ids == user)[0]
-                    if len(user_idx) > max_windows_per_user:
-                        user_idx = np.random.choice(
-                            user_idx,
-                            size=max_windows_per_user,
-                            replace=False
-                        )
-                    indices.extend(user_idx)
-                return np.array(indices)
-            
-            source_indices = get_sampled_indices(source_users)
-            target_indices = get_sampled_indices(target_users)
-            
-            # Further downsample if still too large
-            if len(source_indices) > max_total_windows:
-                source_indices = np.random.choice(source_indices, max_total_windows, replace=False)
-            if len(target_indices) > max_total_windows:
-                target_indices = np.random.choice(target_indices, max_total_windows, replace=False)
-                
-            Z_source = Z_normalized[source_indices]
-            Z_target = Z_normalized[target_indices]
-            y_source = y[source_indices]
-            y_target = y[target_indices]
-            
-            logger.info(f"Split {split+1}/{n_splits}: Using {len(Z_source)} source and {len(Z_target)} target windows")
-            
-            # Visualize alignment for first split
-            if split == 0:
-                visualize_alignment(Z_source, Z_target, y_source,
-                                  f"results/{args.dataset.lower()}_alignment_tsne.png")
-            
-            # Matrix chunking for large datasets
-            def chunked_hungarian(aligner, Z1, Z2):
-                if len(Z1) * len(Z2) > 1e7:  # 10M element threshold
-                    chunk_size = 500
-                    assignments = []
-                    for i in range(0, len(Z1), chunk_size):
-                        for j in range(0, len(Z2), chunk_size):
-                            Z1_chunk = Z1[i:i+chunk_size]
-                            Z2_chunk = Z2[j:j+chunk_size]
-                            row_ind, col_ind = aligner(Z1_chunk, Z2_chunk)
-                            assignments.extend([(i + ri, j + ci) for ri, ci in zip(row_ind, col_ind)])
-                    return zip(*assignments)
-                else:
-                    return aligner(Z1, Z2)
-            
-            # Use both alignment methods
-            for aligner_name, aligner in [
-                ("QuantumHungarian", QuantumHungarian(temp=ALIGNMENT_TEMP, n_iter=ALIGNMENT_N_ITER, feature_weight=0.85)),
-                ("SinkhornAlign", SinkhornAlign(n_iter=20, epsilon=0.1))
-            ]:
-                try:
-                    if "Quantum" in aligner_name and len(Z_source) * len(Z_target) > 2e6:
-                        logger.info(f"Using chunked Hungarian for large matrix: {len(Z_source)}x{len(Z_target)}")
-                        row_ind, col_ind, prob_matrix = chunked_hungarian(aligner, Z_source, Z_target)
-                    else:
-                        row_ind, col_ind, prob_matrix = aligner(Z_source, Z_target)
-                    
-                    # Convert labels to original space if needed
-                    if subset_label_encoder:
-                        y_source_orig = subset_label_encoder.inverse_transform(y_source)
-                        y_target_orig = subset_label_encoder.inverse_transform(y_target)
-                    else:
-                        y_source_orig, y_target_orig = y_source, y_target
-                    
-                    acc, f1, temporal, prob_score = evaluate_alignment(y_source_orig, y_target_orig, row_ind, col_ind, prob_matrix)
-                    logger.info(f"Split {split+1}/{n_splits}, {aligner_name} - Acc: {acc*100:.2f}%, F1: {f1:.4f}, Temporal: {temporal:.4f}, Prob: {prob_score:.4f}")
-                    
-                    # Store best result for this split
-                    if aligner_name == "QuantumHungarian" or (f1_scores and f1 > max(f1_scores)):
-                        if f1_scores and aligner_name != "QuantumHungarian":
-                            # Replace previous result if this is better
-                            accuracies[-1] = acc
-                            f1_scores[-1] = f1
-                            temporal_coherences[-1] = temporal
-                            prob_scores[-1] = prob_score
-                        else:
-                            accuracies.append(acc)
-                            f1_scores.append(f1)
-                            temporal_coherences.append(temporal)
-                            prob_scores.append(prob_score)
-                except Exception as e:
-                    logger.error(f"Error during {aligner_name} alignment in split {split+1}: {e}")
-                    logger.exception(e)
+        source_mask, target_mask = np.isin(user_ids, source_users), np.isin(user_ids, target_users)
+        Z_source, Z_target = Z[source_mask], Z[target_mask]
+        y_source, y_target = y[source_mask], y[target_mask]
         
-        except Exception as e:
-            logger.error(f"Critical error in split {split+1}: {e}")
-            logger.exception(e)
+        if Z_source.shape[0] == 0 or Z_target.shape[0] == 0:
+            logger.warning(f"Skipping split {split+1}: Empty source or target set.")
             continue
+        
+        # Use both alignment methods
+        for aligner_name, aligner in [
+            ("QuantumHungarian", QuantumHungarian(temp=ALIGNMENT_TEMP, n_iter=ALIGNMENT_N_ITER, feature_weight=args.feature_weight)),
+            ("SinkhornAlign", SinkhornAlign(n_iter=20, epsilon=0.1))
+        ]:
+            try:
+                row_ind, col_ind = aligner(Z_source, Z_target)
+                
+                # Convert labels to original space if needed
+                if subset_label_encoder:
+                    y_source_orig = subset_label_encoder.inverse_transform(y_source)
+                    y_target_orig = subset_label_encoder.inverse_transform(y_target)
+                else:
+                    y_source_orig, y_target_orig = y_source, y_target
+                
+                acc, f1, temporal = evaluate_alignment(y_source_orig, y_target_orig, row_ind, col_ind)
+                logger.info(f"Split {split+1}/{n_splits}, {aligner_name} - Acc: {acc*100:.2f}%, F1: {f1:.4f}, Temporal: {temporal:.4f}")
+                
+                # Store best result for this split
+                if aligner_name == "QuantumHungarian" or f1 > f1_scores[-1] if f1_scores else True:
+                    if f1_scores and aligner_name != "QuantumHungarian":
+                        # Replace previous result if this is better
+                        accuracies[-1] = acc
+                        f1_scores[-1] = f1
+                        temporal_coherences[-1] = temporal
+                    else:
+                        accuracies.append(acc)
+                        f1_scores.append(f1)
+                        temporal_coherences.append(temporal)
+            except Exception as e:
+                logger.error(f"Error during {aligner_name} alignment in split {split+1}: {e}")
     
     avg_acc = np.mean(accuracies) if accuracies else 0
     avg_f1 = np.mean(f1_scores) if f1_scores else 0
     avg_temporal = np.mean(temporal_coherences) if temporal_coherences else 0
-    avg_prob = np.mean(prob_scores) if prob_scores else 0
     
     results_msg = (f"\n🎯 Cross-User Alignment Results (Avg over {len(accuracies)} valid splits):\n"
                   f"Accuracy: {avg_acc*100:.2f}%\n"
                   f"F1 Score: {avg_f1:.4f}\n"
-                  f"Temporal Coherence: {avg_temporal:.4f}\n"
-                  f"Probability Score: {avg_prob:.4f}")
+                  f"Temporal Coherence: {avg_temporal:.4f}")
     print(results_msg)
     logger.info(results_msg)
     
@@ -1393,7 +1134,6 @@ def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
         "Average_Accuracy": f"{avg_acc*100:.2f}%",
         "Average_F1_Score": f"{avg_f1:.4f}",
         "Average_Temporal_Coherence": f"{avg_temporal:.4f}",
-        "Average_Probability_Score": f"{avg_prob:.4f}",
         "Number_of_Valid_Splits": len(accuracies)
     }
     results_filename = f"results/{args.dataset.lower()}_alignment_metrics.txt"
@@ -1402,59 +1142,52 @@ def evaluate_alignment_with_mh(X, y, user_ids, encoder, args):
     print_stage_footer("ALIGNMENT EVALUATION", args.dataset)
     return avg_acc, avg_f1, avg_temporal
 
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
 # ---------------------- Main Function ----------------------
 def main():
     global subset_label_encoder
-    
-    # ==================== REPRODUCIBILITY ENHANCEMENTS ====================
-    # Set all random seeds for reproducibility
-    seed = 42
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    # =======================================================================
-    
-    parser = argparse.ArgumentParser(description="Enhanced HAR SSL Pipeline (v8.1)")
+    parser = argparse.ArgumentParser(description="Enhanced HAR SSL Pipeline (v8)")
     parser.add_argument("--mode", type=str, default="all", choices=["pretrain", "finetune", "linear_probe", "alignment", "all"], help="Pipeline mode")
     parser.add_argument("--dataset", type=str, default="PAMAP2", choices=["UCI", "PAMAP2"], help="Dataset to use")
-    parser.add_argument("--latent_dim", type=int, default=768, help="Latent dimension size")
+    parser.add_argument("--latent_dim", type=int, default=256, help="Latent dimension size")
     parser.add_argument("--transformer_seq_len", type=int, default=32, help="Sequence length for transformer input")
-    parser.add_argument("--num_transformer_layers", type=int, default=3, help="Number of transformer layers")
+    parser.add_argument("--num_transformer_layers", type=int, default=2, help="Number of transformer layers")
     parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
     parser.add_argument("--window_size", type=int, default=192, help="Window size")
     parser.add_argument("--window_step", type=int, default=64, help="Step size")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
-    parser.add_argument("--epochs", type=int, default=120, help="Epochs for SSL pretraining")
+    parser.add_argument("--epochs", type=int, default=100, help="Epochs for SSL pretraining")
     parser.add_argument("--ft_epochs", type=int, default=30, help="Epochs for fine-tuning")
-    parser.add_argument("--lr", type=float, default=0.0002, help="LR for SSL pretraining")
+    parser.add_argument("--lr", type=float, default=0.0005, help="LR for SSL pretraining")
     parser.add_argument("--ft_lr", type=float, default=0.001, help="LR for fine-tuning")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument("--patience", type=int, default=20, help="Patience for early stopping")
     parser.add_argument("--num_workers", type=int, default=2, help="Data loading workers")
-    parser.add_argument("--ssl_loss", type=str, default="vicreg", choices=["ntxent", "vicreg"], help="SSL loss function")
-    parser.add_argument("--temperature", type=float, default=0.1, help="Temp for contrastive loss")
-    parser.add_argument("--sim_weight", type=float, default=30.0, help="Sim weight for VICReg")
-    parser.add_argument("--var_weight", type=float, default=30.0, help="Var weight for VICReg")
-    parser.add_argument("--cov_weight", type=float, default=0.5, help="Cov weight for VICReg")
-    parser.add_argument("--time_warp_limit", type=float, default=0.3, help="Time warping limit")
-    parser.add_argument("--channel_drop_prob", type=float, default=0.4, help="Channel dropout probability")
-    parser.add_argument("--acc_noise_std", type=float, default=0.15, help="Accelerometer noise std")
-    parser.add_argument("--gyro_noise_std", type=float, default=0.2, help="Gyroscope noise std")
-    parser.add_argument("--scale_min", type=float, default=0.7, help="Minimum scaling factor")
-    parser.add_argument("--scale_max", type=float, default=1.3, help="Maximum scaling factor")
-    parser.add_argument("--feature_weight", type=float, default=0.85, help="Feature weight for QuantumHungarian")
+    parser.add_argument("--ssl_loss", type=str, default="ntxent", choices=["ntxent", "vicreg"], help="SSL loss function")
+    parser.add_argument("--temperature", type=float, default=0.2, help="Temp for contrastive loss")
+    parser.add_argument("--sim_weight", type=float, default=25.0, help="Sim weight for VICReg")
+    parser.add_argument("--var_weight", type=float, default=25.0, help="Var weight for VICReg")
+    parser.add_argument("--cov_weight", type=float, default=1.0, help="Cov weight for VICReg")
+    parser.add_argument("--time_warp_limit", type=float, default=0.2, help="Time warping limit")
+    parser.add_argument("--channel_drop_prob", type=float, default=0.3, help="Channel dropout probability")
+    parser.add_argument("--noise_std", type=float, default=0.1, help="Noise standard deviation")
+    parser.add_argument("--scale_min", type=float, default=0.8, help="Minimum scaling factor")
+    parser.add_argument("--scale_max", type=float, default=1.2, help="Maximum scaling factor")
+    parser.add_argument("--feature_weight", type=float, default=0.7, help="Feature weight for QuantumHungarian")
     parser.add_argument("--subset_fraction", type=float, default=1.0, help="Fraction of data to use")
-    parser.add_argument("--warmup_epochs", type=int, default=15, help="Warm-up epochs for LR")
-    parser.add_argument("--swa_start", type=int, default=80, help="Epoch to start SWA")
+    parser.add_argument("--warmup_epochs", type=int, default=10, help="Warm-up epochs for LR")
+    parser.add_argument("--swa_start", type=int, default=70, help="Epoch to start SWA")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
-    parser.add_argument("--temp_weight", type=float, default=0.5, help="Temporal consistency loss weight")
     
     args = parser.parse_args()
-    logger.info(f"Starting pipeline (v8.1) with arguments: {vars(args)}")
+    logger.info(f"Starting pipeline (v8) with arguments: {vars(args)}")
     os.makedirs("results", exist_ok=True)
     logger.info("Created/verified 'results' directory for outputs.")
     
@@ -1534,13 +1267,12 @@ def main():
                 input_dim, args.latent_dim, dropout=args.dropout,
                 transformer_seq_len=args.transformer_seq_len,
                 num_transformer_layers=args.num_transformer_layers
-            )
+            ).to(get_device())
             try:
                 encoder.load_state_dict(torch.load(encoder_path, map_location=get_device()))
             except Exception as e:
                 logger.error(f"Failed to load encoder state dict: {e}")
                 raise
-            encoder = encoder.to(get_device())
         elif args.mode != "pretrain":
             logger.error(f"Pre-trained encoder not found at {encoder_path}")
             raise FileNotFoundError(f"Encoder not found: {encoder_path}")

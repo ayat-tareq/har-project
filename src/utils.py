@@ -13,8 +13,6 @@ import logging
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
 import random
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
 
 # Configure logging
 logging.basicConfig(
@@ -26,42 +24,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-def cosine_similarity(a, b):
-    """Compute cosine similarity between two sets of vectors"""
-    a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-8)
-    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-8)
-    return np.einsum('ik,jk->ij', a_norm, b_norm)
-
-def visualize_alignment(embeddings1, embeddings2, labels1=None, labels2=None, filename='alignment_tsne.png'):
-    """Visualize two sets of embeddings using TSNE"""
-    # Combine the embeddings
-    X = np.concatenate([embeddings1, embeddings2])
-    if labels1 is not None and labels2 is not None:
-        labels = np.concatenate([labels1, labels2])
-        n1 = len(embeddings1)
-        n2 = len(embeddings2)
-    else:
-        labels = None
-    
-    # Apply TSNE
-    tsne = TSNE(n_components=2, random_state=42, perplexity=30)
-    X_tsne = tsne.fit_transform(X)
-    
-    # Plot
-    plt.figure(figsize=(10, 8))
-    if labels is not None:
-        scatter = plt.scatter(X_tsne[:n1, 0], X_tsne[:n1, 1], c=labels[:n1], cmap='tab10', alpha=0.5, label='Set 1')
-        plt.scatter(X_tsne[n1:, 0], X_tsne[n1:, 1], c=labels[n1:], cmap='tab10', marker='x', alpha=0.5, label='Set 2')
-        plt.legend()
-    else:
-        plt.scatter(X_tsne[:n1, 0], X_tsne[:n1, 1], alpha=0.5, label='Set 1')
-        plt.scatter(X_tsne[n1:, 0], X_tsne[n1:, 1], marker='x', alpha=0.5, label='Set 2')
-        plt.legend()
-    plt.title('TSNE Visualization of Aligned Embeddings')
-    plt.savefig(filename)
-    plt.close()
-    return X_tsne
 
 def load_data(dataset='UCI'):
     """Load dataset with user IDs for cross-validation"""
@@ -246,7 +208,7 @@ def load_pamap2(data_root='data/PAMAP2/PAMAP2_Dataset/Protocol', window_size=192
     return X_train_scaled, y_train, X_val, y_val, X_test, y_test, user_train, user_val, user_test
 
 def sliding_window(data, window_size, step, labels=None, user_ids=None):
-    """Apply sliding window with user ID tracking and confidence scores"""
+    """Apply sliding window with user ID tracking"""
     from numpy.lib.stride_tricks import sliding_window_view
     
     try:
@@ -286,15 +248,6 @@ def sliding_window(data, window_size, step, labels=None, user_ids=None):
                     np.bincount(window, weights=weights[:len(window)]).argmax()
                     for window in label_windows
                 ])
-                confidences = np.array([
-                    np.max(np.bincount(window, weights=weights[:len(window)])) / np.sum(weights[:len(window)])
-                    for window in label_windows
-                ])
-                
-                # Log low confidence windows
-                low_conf_mask = confidences < 0.6
-                if np.any(low_conf_mask):
-                    logger.warning(f"Found {low_conf_mask.sum()} windows with label confidence < 0.6")
             except Exception:
                 label_windows = []
                 for i in range(len(windows)):
@@ -303,14 +256,8 @@ def sliding_window(data, window_size, step, labels=None, user_ids=None):
                     label_windows.append(labels[start:end])
                 label_windows = np.stack(label_windows)
                 majority = np.apply_along_axis(lambda x: np.bincount(x).argmax(), 1, label_windows)
-                confidences = np.array([
-                    np.max(np.bincount(window)) / len(window)
-                    for window in label_windows
-                ])
             results.append(majority)
-            results.append(confidences)
         else:
-            results.append(np.array([]))
             results.append(np.array([]))
     
     if user_ids is not None:
@@ -330,22 +277,13 @@ def sliding_window(data, window_size, step, labels=None, user_ids=None):
     return tuple(results)
 
 class SinkhornAlign:
-    """Optimal transport-based alignment with entropy regularization and class-aware normalization"""
-    def __init__(self, n_iter=20, epsilon=0.1, class_aware=False):
+    """Optimal transport-based alignment with entropy regularization"""
+    def __init__(self, n_iter=20, epsilon=0.1):
         self.n_iter = n_iter
         self.epsilon = epsilon
-        self.class_aware = class_aware
 
-    def __call__(self, A, B, class_labels=None):
+    def __call__(self, A, B):
         dist = np.linalg.norm(A[:, None] - B[None, :], axis=2)
-        
-        if self.class_aware and class_labels is not None:
-            # Class-aware normalization
-            for cls in np.unique(class_labels):
-                cls_mask = (class_labels == cls)
-                if cls_mask.sum() > 1:
-                    dist[cls_mask] /= dist[cls_mask].max(axis=1, keepdims=True)
-        
         K = np.exp(-dist / self.epsilon)
         
         u = np.ones((K.shape[0],)) / K.shape[0]
@@ -357,18 +295,17 @@ class SinkhornAlign:
         
         P = np.diag(u) @ K @ np.diag(v)
         row_ind, col_ind = linear_sum_assignment(-P)
-        return row_ind, col_ind, P
+        return row_ind, col_ind
 
 class QuantumHungarian:
-    """Time-aware alignment with temporal coherence and probabilistic assignments"""
-    def __init__(self, temp=0.2, n_iter=100, feature_weight=0.7, softmax_temp=0.1):
+    """Time-aware alignment with temporal coherence"""
+    def __init__(self, temp=0.2, n_iter=100, feature_weight=0.7):
         self.temp = temp
         self.n_iter = n_iter
         self.feature_weight = feature_weight
-        self.softmax_temp = softmax_temp
         self.rng = np.random.default_rng(42)
 
-    def __call__(self, A, B, return_prob=False):
+    def __call__(self, A, B):
         A_norm = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-8)
         B_norm = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-8)
         feature_sim = np.dot(A_norm, B_norm.T)
@@ -378,17 +315,11 @@ class QuantumHungarian:
         
         combined_sim = self.feature_weight * feature_sim + (1 - self.feature_weight) * time_sim
         
-        if return_prob:
-            # Convert to probability distribution
-            prob_matrix = np.exp(combined_sim / self.softmax_temp)
-            prob_matrix = prob_matrix / prob_matrix.sum(axis=1, keepdims=True)
-            return prob_matrix
-        else:
-            row_ind, col_ind = linear_sum_assignment(-combined_sim)
-            return row_ind, col_ind, combined_sim
+        row_ind, col_ind = linear_sum_assignment(-combined_sim)
+        return row_ind, col_ind
 
-def evaluate_alignment(y_true, y_shuffled, row_ind, col_ind, prob_matrix=None):
-    """Calculate alignment accuracy with additional metrics and probabilistic evaluation"""
+def evaluate_alignment(y_true, y_shuffled, row_ind, col_ind):
+    """Calculate alignment accuracy with additional metrics"""
     if len(row_ind) == 0:
         return 0.0, 0.0, 0.0
     
@@ -406,13 +337,7 @@ def evaluate_alignment(y_true, y_shuffled, row_ind, col_ind, prob_matrix=None):
     
     temporal_coherence = np.corrcoef(row_ind[valid_indices], col_ind[valid_indices])[0, 1]
     
-    # Probabilistic evaluation if available
-    prob_score = 0.0
-    if prob_matrix is not None:
-        matched_probs = prob_matrix[row_ind[valid_indices], col_ind[valid_indices]]
-        prob_score = np.mean(matched_probs)
-    
-    return accuracy, f1, temporal_coherence, prob_score
+    return accuracy, f1, temporal_coherence
 
 class EarlyStopping:
     """Early stopping handler for training loops"""
